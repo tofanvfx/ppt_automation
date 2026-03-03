@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PowerPoint / Word
+*.pptx
+!template.pptx
+*.docx
+!content.docx
+~$*
+
+# Debug/Logs
+*.txt
+*.log
+
+# Scripts / Misc
+create_quiz_test.py
+deep_layout_inspect.py
+inspect_previous.py
+test_sec_id.py
+verify_quiz_final.py
+verify_quiz_slide.py
+verify_quiz_slide_deep.py
+verify_previous.py
+debug_sections.py
+inspect_*.py
+test_*.py
+verify_*.py
+create_*.py
+init_debug.txt
+captured_templates.txt
+quiz_verify_results.txt
+quiz_layout_info.txt
+debug_*.txt
+layouts.txt
+
+# Large files (optional, but keeping template/content for now)
+# Generated_Presentation.pptx
