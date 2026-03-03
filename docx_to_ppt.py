@@ -24,6 +24,22 @@ doc = Document(docx_file)
 def clean(text):
     return text.strip().lower()
 
+def get_text(entry):
+    """Extract plain text from a content entry (either a string or a (text, ilvl) tuple)."""
+    return entry[0] if isinstance(entry, tuple) else entry
+
+def copy_image_rels(element, source_part, target_part):
+    """Copy image relationships referenced by blip elements from source to target part."""
+    ns = {'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'}
+    r_ns = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
+    for blip in element.findall('.//a:blip', namespaces=ns):
+        old_rid = blip.get(f'{r_ns}embed')
+        if old_rid and old_rid in source_part.rels:
+            rel = source_part.rels[old_rid]
+            # Add the image to the target part and get a new rId
+            new_rid = target_part.relate_to(rel.target_part, rel.reltype)
+            blip.set(f'{r_ns}embed', new_rid)
+
 def get_layout(name):
     for layout in prs.slide_layouts:
         if layout.name == f"LAYOUT_{name}":
@@ -61,8 +77,9 @@ def get_layout(name):
                 return layout
 
     if name.replace("_", "").lower() in ('quiztimepage', 'sstquiztimepage', 'sst_quiztime_page'):
+        # Return _01 as default; the main loop will override based on option lengths
         for layout in prs.slide_layouts:
-            if layout.name == 'LAYOUT_sst_quiztime_page':
+            if layout.name == 'LAYOUT_sst_quiztime_page_01':
                 return layout
 
     if name.replace("_", "").lower() in ('sstcontentpage01', 'sstcontentpage1'):
@@ -90,6 +107,16 @@ def get_layout(name):
             if layout.name == 'LAYOUT_sst_previous_page':
                 return layout
 
+    if name.replace("_", "").lower() in ('homeworkpage', 'ssthomeworkpage', 'ssthomework', 'homework'):
+        for layout in prs.slide_layouts:
+            if layout.name == 'LAYOUT_sst_homework_page':
+                return layout
+
+    if name.replace("_", "").lower() in ('discussionpage', 'sstdiscussionpage', 'sstdiscussion', 'sst_discussion_page'):
+        for layout in prs.slide_layouts:
+            if layout.name == 'LAYOUT_sst_discussion_page':
+                return layout
+
     return None
 
 # Nested dictionary to store templates per layout
@@ -97,7 +124,9 @@ sst_content_templates = {
     'LAYOUT_sst_content_page_01': {'topic': None, 'subtopic': None, 'text': None},
     'LAYOUT_sst_content_page_02': {'topic': None, 'subtopic': None, 'text': None},
     'LAYOUT_sst_notedown_page': {'text': None},
-    'LAYOUT_sst_quiztime_page': {'title': None, 'question': None, 'options': None}
+    'LAYOUT_sst_quiztime_page_01': {'title': None, 'question': None, 'options': [], 'picture': None},
+    'LAYOUT_sst_quiztime_page_02': {'title': None, 'question': None, 'options': [], 'picture': None},
+    'LAYOUT_sst_discussion_page': {'question1': None}
 }
 
 # Extract lo_page group shape XML before processing slides
@@ -142,6 +171,12 @@ for layout in prs.slide_layouts:
             has_subtopic = False
             has_quiz_title = False
             
+            # 0. Capture standalone PICTURE shapes for quiztime layouts
+            if layout.name.startswith('LAYOUT_sst_quiztime_page') and shape.shape_type == 13:  # PICTURE
+                templates['picture'] = copy.deepcopy(shape.element)
+                shape.element.getparent().remove(shape.element)
+                continue
+
             # 1. Check groups for topic/subtopic or "QUIZ TIME"
             if shape.shape_type == 6:  # GROUP
                 for sub in shape.shapes:
@@ -149,7 +184,7 @@ for layout in prs.slide_layouts:
                         txt = sub.text.strip().lower()
                         if txt == 'topic': has_topic = True
                         elif txt == 'subtopic': has_subtopic = True
-                        elif layout.name == 'LAYOUT_sst_quiztime_page' and 'quiz time' in txt:
+                        elif layout.name.startswith('LAYOUT_sst_quiztime_page') and 'quiz time' in txt:
                             has_quiz_title = True
                 
                 if has_quiz_title:
@@ -173,15 +208,18 @@ for layout in prs.slide_layouts:
             # 3. Check for body/placeholder text (question, options, or general text)
             elif shape.has_text_frame and ('Text goes here' in shape.text or (shape.is_placeholder and shape.placeholder_format.type == PP_PLACEHOLDER.BODY)):
                 txt = shape.text.lower()
-                if layout.name == 'LAYOUT_sst_quiztime_page':
+                if layout.name.startswith('LAYOUT_sst_quiztime_page'):
                     if 'quiz time' in txt:
                         templates['title'] = copy.deepcopy(shape.element)
                     elif 'question' in txt:
                         templates['question'] = copy.deepcopy(shape.element)
                     elif 'options' in txt:
-                        templates['options'] = copy.deepcopy(shape.element)
+                        templates['options'].append(copy.deepcopy(shape.element))
                     elif txt.strip(): 
                         if not templates['title']: templates['title'] = copy.deepcopy(shape.element)
+                elif layout.name == 'LAYOUT_sst_discussion_page':
+                    if 'question1' in txt:
+                        templates['question1'] = copy.deepcopy(shape.element)
                 else:
                     templates['text'] = copy.deepcopy(shape.element)
                 
@@ -207,13 +245,22 @@ def iter_block_items(parent):
 sections = []
 current_section = None
 
+w_ns = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
 for item in iter_block_items(doc):
     lines_to_process = []
     images_to_add = []
     
     if isinstance(item, Paragraph):
         text = item.text.strip()
-        lines_to_process.append(text)
+        # Detect indent level from numPr/ilvl
+        ilvl = 0
+        numPr = item._element.find(f'.//{{{w_ns}}}numPr')
+        if numPr is not None:
+            ilvl_elem = numPr.find(f'{{{w_ns}}}ilvl')
+            if ilvl_elem is not None:
+                ilvl = int(ilvl_elem.get(f'{{{w_ns}}}val', '0'))
+        lines_to_process.append((text, ilvl))
         # Extract images from paragraph
         for run in item.runs:
             for drawing in run._element.findall('.//w:drawing', namespaces=run._element.nsmap):
@@ -229,18 +276,20 @@ for item in iter_block_items(doc):
             if len(cells) >= 2:
                 key = cells[0].rstrip(':').strip()
                 val = cells[1].lstrip(':').strip()
-                lines_to_process.append(f"{key}: {val}")
+                lines_to_process.append((f"{key}: {val}", 0))
             elif len(cells) == 1:
-                lines_to_process.append(cells[0])
+                lines_to_process.append((cells[0], 0))
 
-    for text in lines_to_process:
+    for entry in lines_to_process:
+        text = entry[0] if isinstance(entry, tuple) else entry
+        ilvl = entry[1] if isinstance(entry, tuple) else 0
+        
         if not text and not images_to_add:
             continue
             
         match = re.search(r'\[\s*([^\]]+?)\s*\]', text)
         if match:
             name = match.group(1).strip()
-            # print(f"DEBUG: Found section name: '{name}'")
             current_section = {
                 'name': name,
                 'content': [],
@@ -249,7 +298,7 @@ for item in iter_block_items(doc):
             sections.append(current_section)
         elif current_section is not None:
             if text:
-                current_section['content'].append(text)
+                current_section['content'].append((text, ilvl))
             if images_to_add:
                 current_section['images'].extend(images_to_add)
                 images_to_add = []
@@ -333,6 +382,30 @@ for section in sections:
             layout = get_layout('sst_content_page_02')
         else:
             layout = get_layout('sst_content_page_01')
+    elif sname in ('sst_quiztime_page', 'quiztime_page', 'sstquiztimepage'):
+        # Parse quiz content first to determine layout
+        quiz_data = {'question': '', 'options': []}
+        for entry in section['content']:
+            line = get_text(entry)
+            line_low = line.lower()
+            if 'question:' in line_low:
+                quiz_data['question'] = line.split(':', 1)[1].strip()
+            elif 'options:' in line_low:
+                opts = line.split(':', 1)[1].strip()
+                quiz_data['options'] = [o.strip() for o in opts.split(',')]
+            elif line.strip():
+                if not quiz_data['question']: quiz_data['question'] = line.strip()
+                else: quiz_data['options'].append(line.strip())
+        
+        # Pick layout based on option character length
+        # If ANY option > 25 chars → _01 (long), else _02 (short)
+        use_long = any(len(opt) > 25 for opt in quiz_data['options'])
+        if use_long:
+            layout = get_layout('sst_quiztime_page_01')
+            print(f"Quiz options have long text (>25 chars) -> using LAYOUT_sst_quiztime_page_01")
+        else:
+            layout = get_layout('sst_quiztime_page_02')
+            print(f"Quiz options are short (<=25 chars) -> using LAYOUT_sst_quiztime_page_02")
     else:
         layout = get_layout(section['name'])
 
@@ -344,7 +417,8 @@ for section in sections:
     
     if section['name'].replace("_", "").lower() in ('mathpagetitle', 'mathtitlepage', 'sstpagetitle', 'ssttitlepage'):
         data = {}
-        for line in section['content']:
+        for entry in section['content']:
+            line = get_text(entry)
             if ":" in line:
                 parts = line.split(":", 1)
                 data[parts[0].strip().upper()] = parts[1].strip()
@@ -389,12 +463,25 @@ for section in sections:
         group_xml = lo_group_xmls.get(layout.name)
             
         if group_xml is not None:
-            current_top_offset = 0
-            for i, line in enumerate(section['content']):
-                clean_line = line.strip()
-                if clean_line.startswith(("•", "-", "*")):
-                    clean_line = "❖ " + clean_line.lstrip("•-*").strip()
+            # Group content: merge sub-bullets (ilvl > 0) with their parent line
+            # Each item: (main_text, [(sub_text, ilvl), ...])
+            grouped_items = []
+            for entry in section['content']:
+                text = entry[0] if isinstance(entry, tuple) else entry
+                ilvl = entry[1] if isinstance(entry, tuple) else 0
+                clean_line = text.strip()
+                if clean_line.startswith(('•', '-', '*')):
+                    clean_line = clean_line.lstrip('•-*').strip()
                 
+                if ilvl == 0:
+                    grouped_items.append((clean_line, []))
+                elif ilvl > 0 and grouped_items:
+                    grouped_items[-1][1].append((clean_line, ilvl))
+                else:
+                    grouped_items.append((clean_line, []))
+            
+            current_top_offset = 0
+            for main_text, sub_entries in grouped_items:
                 new_element = copy.deepcopy(group_xml)
                 slide.shapes._spTree.append(new_element)
                 new_shape = slide.shapes[-1]
@@ -402,64 +489,93 @@ for section in sections:
                 
                 for subshape in new_shape.shapes:
                     if getattr(subshape, 'has_text_frame', False) and 'Text goes here' in subshape.text:
-                        subshape.text = clean_line
-                        for paragraph in subshape.text_frame.paragraphs:
-                            for run in paragraph.runs:
-                                run.font.size = Pt(36)
+                        tf = subshape.text_frame
+                        # Set main text in first paragraph
+                        tf.paragraphs[0].text = main_text
+                        for run in tf.paragraphs[0].runs:
+                            run.font.size = Pt(36)
+                            run.font.color.rgb = RGBColor(255, 255, 255)
+                        
+                        # Add sub-bullet paragraphs with nested indentation
+                        for bullet_text, bullet_ilvl in sub_entries:
+                            p = tf.add_paragraph()
+                            # Indent and bullet marker based on nesting level
+                            indent = '    ' * bullet_ilvl
+                            markers = {1: '•', 2: '◦', 3: '▪'}
+                            marker = markers.get(bullet_ilvl, '▪')
+                            p.text = f'{indent}{marker} {bullet_text}'
+                            p.space_before = Pt(4)
+                            # Smaller font for deeper levels
+                            font_size = max(20, 36 - (bullet_ilvl * 4))
+                            for run in p.runs:
+                                run.font.size = Pt(font_size)
                                 run.font.color.rgb = RGBColor(255, 255, 255)
                 
+                # Calculate height based on content
                 chars_per_line = 65
-                line_count = max(1, len(clean_line) // chars_per_line + (1 if len(clean_line) % chars_per_line > 0 else 0))
-                current_top_offset += int(Inches(0.9 + 0.55 * (line_count - 1)))
+                line_count = max(1, len(main_text) // chars_per_line + (1 if len(main_text) % chars_per_line > 0 else 0))
+                sub_height = len(sub_entries) * 0.45
+                current_top_offset += int(Inches(0.9 + 0.55 * (line_count - 1) + sub_height))
                 
-            print(f"Updated {layout.name} with {len(section['content'])} items")
-    elif layout.name == 'LAYOUT_sst_quiztime_page':
+            total_subs = sum(len(s) for _, s in grouped_items)
+            print(f"Updated {layout.name} with {len(grouped_items)} items ({total_subs} sub-bullets)")
+    elif layout.name in ('LAYOUT_sst_quiztime_page_01', 'LAYOUT_sst_quiztime_page_02'):
         templates = sst_content_templates.get(layout.name, {})
         
+        # Inject static picture
+        if templates.get('picture') is not None:
+            pic_elem = copy.deepcopy(templates['picture'])
+            copy_image_rels(pic_elem, layout.part, slide.part)
+            slide.shapes._spTree.append(pic_elem)
+
         # Inject static title
         if templates.get('title') is not None:
-            slide.shapes._spTree.append(copy.deepcopy(templates['title']))
+            title_elem = copy.deepcopy(templates['title'])
+            copy_image_rels(title_elem, layout.part, slide.part)
+            slide.shapes._spTree.append(title_elem)
 
-        data = {'question': '', 'options': []}
-        for line in section['content']:
-            line_low = line.lower()
-            if 'question:' in line_low:
-                data['question'] = line.split(':', 1)[1].strip()
-            elif 'options:' in line_low:
-                opts = line.split(':', 1)[1].strip()
-                data['options'] = [o.strip() for o in opts.split(',')]
-            elif line.strip():
-                if not data['question']: data['question'] = line.strip()
-                else: data['options'].append(line.strip())
+        # Reuse quiz_data if already parsed during layout selection, otherwise parse now
+        if 'quiz_data' not in dir():
+            quiz_data = {'question': '', 'options': []}
+            for entry in section['content']:
+                line = get_text(entry)
+                line_low = line.lower()
+                if 'question:' in line_low:
+                    quiz_data['question'] = line.split(':', 1)[1].strip()
+                elif 'options:' in line_low:
+                    opts = line.split(':', 1)[1].strip()
+                    quiz_data['options'] = [o.strip() for o in opts.split(',')]
+                elif line.strip():
+                    if not quiz_data['question']: quiz_data['question'] = line.strip()
+                    else: quiz_data['options'].append(line.strip())
 
         if templates.get('question') is not None:
             slide.shapes._spTree.append(copy.deepcopy(templates['question']))
-            replace_text_preserve_format(slide.shapes[-1], data['question'])
-            
-        if templates.get('options') is not None:
-            slide.shapes._spTree.append(copy.deepcopy(templates['options']))
-            replace_text_preserve_format(slide.shapes[-1], data['options'])
+            replace_text_preserve_format(slide.shapes[-1], quiz_data['question'])
         
-        print(f"Updated {layout.name} with quiz question and {len(data['options'])} options.")
-        body_text = "\n".join(section['content'])
-        body_filled = False
-        title_filled = False
-        for shape in slide.shapes:
-            if not shape.is_placeholder: continue
-            ph_type = shape.placeholder_format.type
-            if ph_type in (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE) and not title_filled:
-                shape.text = title_text
-                title_filled = True
-                print(f"Updated {section['name']} Title")
-            elif ph_type in (PP_PLACEHOLDER.BODY, PP_PLACEHOLDER.OBJECT) and not body_filled:
-                shape.text = body_text
-                body_filled = True
-                print(f"Updated {section['name']} Body")
+        # Inject options
+        option_templates = templates.get('options', [])
+        if len(option_templates) == 1:
+            # _01 style: single placeholder, all options as multi-line text
+            slide.shapes._spTree.append(copy.deepcopy(option_templates[0]))
+            replace_text_preserve_format(slide.shapes[-1], quiz_data['options'])
+        elif len(option_templates) > 1:
+            # _02 style: separate placeholder per option
+            for idx, opt_template in enumerate(option_templates):
+                slide.shapes._spTree.append(copy.deepcopy(opt_template))
+                if idx < len(quiz_data['options']):
+                    replace_text_preserve_format(slide.shapes[-1], quiz_data['options'][idx])
+                else:
+                    replace_text_preserve_format(slide.shapes[-1], '')
+        
+        print(f"Updated {layout.name} with quiz question and {len(quiz_data['options'])} options.")
+        quiz_data = None  # Reset for next quiz section
     elif layout.name in ('LAYOUT_sst_content_page_01', 'LAYOUT_sst_content_page_02'):
         import io
         data = {}
         data_text_list = []
-        for line in section['content']:
+        for entry in section['content']:
+            line = get_text(entry)
             if ":" in line:
                 parts = line.split(":", 1)
                 key = parts[0].strip().lower()
@@ -608,7 +724,8 @@ for section in sections:
         print("Inserted LAYOUT_final_quiz_page (Welcome Slide)")
 
         qa_pairs = []
-        for line in section['content']:
+        for entry in section['content']:
+            line = get_text(entry)
             if ":" in line:
                 parts = line.split(":", 1)
                 q_text = parts[0].strip()
@@ -640,7 +757,8 @@ for section in sections:
             shape = slide.shapes[-1]
             
             processed_content = []
-            for line in section['content']:
+            for entry in section['content']:
+                line = get_text(entry)
                 clean_line = line.strip()
                 if clean_line.startswith(("•", "-", "*")):
                     clean_line = "❖ " + clean_line.lstrip("•-*").strip()
@@ -648,6 +766,32 @@ for section in sections:
             
             replace_text_preserve_format(shape, processed_content)
             print(f"Updated {layout.name} Body text with preserved formatting and spacing.")
+
+    elif layout.name == 'LAYOUT_sst_discussion_page':
+        templates = sst_content_templates.get(layout.name, {})
+        if templates.get('question1') is not None:
+            # Parse 'question1: <text>' from the content section
+            q1_text = ""
+            for entry in section['content']:
+                line = get_text(entry)
+                if ":" in line:
+                    parts = line.split(":", 1)
+                    if parts[0].strip().lower() == 'question1':
+                        q1_text = parts[1].strip()
+                        break
+                elif line.strip() and not q1_text:
+                    # Fallback: if no colon, just use the first non-empty line
+                    q1_text = line.strip()
+            
+            q1_elem = copy.deepcopy(templates['question1'])
+            slide.shapes._spTree.append(q1_elem)
+            shape = slide.shapes[-1]
+            if q1_text:
+                replace_text_preserve_format(shape, q1_text)
+                print(f"Updated {layout.name} question1 -> '{q1_text[:20]}...'")
+            else:
+                replace_text_preserve_format(shape, "question1")  # Keep original if missing
+                print(f"Inserted {layout.name} with default text")
 
 if __name__ == "__main__":
     import sys
